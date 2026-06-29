@@ -13,18 +13,27 @@ pub trait VisionEngine {
 }
 
 // =====================================================================
-// 2. A IMPLEMENTAÇÃO OPENCV (OTIMIZADA)
+// 2. A IMPLEMENTAÇÃO OPENCV (OTIMIZADA PARA "BATATA")
 // =====================================================================
 pub struct OpenCvTracker {
     face_cascade: objdetect::CascadeClassifier,
     eye_cascade: objdetect::CascadeClassifier,
+    last_face: Option<Rect>,
+    frame_count: i32,
+    detect_face_every: i32,
 }
 
 impl OpenCvTracker {
     pub fn new(face_path: &str, eye_path: &str) -> opencv::Result<Self> {
         let face_cascade = objdetect::CascadeClassifier::new(face_path)?;
         let eye_cascade = objdetect::CascadeClassifier::new(eye_path)?;
-        Ok(Self { face_cascade, eye_cascade })
+        Ok(Self { 
+            face_cascade, 
+            eye_cascade,
+            last_face: None,
+            frame_count: 0,
+            detect_face_every: 3, // Detecta rosto a cada 3 frames (reutiliza nos outros)
+        })
     }
 }
 
@@ -32,57 +41,103 @@ impl VisionEngine for OpenCvTracker {
     fn detect_eyes(&mut self, frame: &Mat) -> opencv::Result<Vec<Point>> {
         let mut gray = Mat::default();
         imgproc::cvt_color(frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
-        imgproc::equalize_hist(&gray.clone(), &mut gray)?;
+        
+        // Lighter histogram equalization - use a separate output to avoid borrow conflicts
+        let mut equalized = Mat::default();
+        imgproc::equalize_hist(&gray, &mut equalized)?;
 
-        // 1. Acha o ROSTO primeiro
-        let mut faces = Vector::<Rect>::new();
-        self.face_cascade.detect_multi_scale(
-            &gray,
-            &mut faces,
-            1.3, // Escala maior = mais rápido (1.3 é ótimo para rostos)
-            5,
-            0,
-            Size::new(100, 100), // Rosto precisa ser grandinho
-            Size::new(0, 0),
-        )?;
+        let mut face = None;
+
+        // ========== OTIMIZAÇÃO 1: REUTILIZAR DETECÇÃO DE ROSTO ==========
+        // Só detecta a cada N frames, reutiliza o anterior
+        if self.frame_count % self.detect_face_every == 0 {
+            let mut faces = Vector::<Rect>::new();
+            self.face_cascade.detect_multi_scale(
+                &gray,
+                &mut faces,
+                1.5,    // ← OTIMIZAÇÃO: Escala maior (1.5 em vez de 1.3)
+                5,
+                0,
+                Size::new(120, 120), // ← OTIMIZAÇÃO: Face mínima maior
+                Size::new(0, 0),
+            )?;
+
+            if !faces.is_empty() {
+                let detected_face = faces.get(0)?;
+                self.last_face = Some(detected_face);
+                face = Some(detected_face);
+            }
+        } else {
+            // Reutiliza o rosto anterior se disponível
+            face = self.last_face;
+        }
+
+        self.frame_count = (self.frame_count + 1) % self.detect_face_every;
 
         let mut eye_centers = Vec::new();
 
-        // Se não achou rosto, retorna vazio (Zero falso positivos na parede)
-        if faces.is_empty() {
+        // Se não achou rosto, retorna vazio
+        if face.is_none() {
             return Ok(eye_centers);
         }
 
-        // Pega apenas o primeiro rosto detectado (o principal)
-        let face = faces.get(0)?;
+        let face = face.unwrap();
 
-        // 2. Cria uma "Região de Interesse" (ROI) na METADE SUPERIOR do rosto
-        // Isso evita que narinas e boca sejam confundidas com olhos
+        // ========== OTIMIZAÇÃO 2: ROI AGRESSIVA PARA OLHOS ==========
         let eye_region = Rect::new(
             face.x, 
-            face.y + (face.height / 5), // Corta um pouco a testa
+            face.y + (face.height / 4),  // Corta mais da testa
             face.width, 
-            face.height / 2 // Pega só até a metade do rosto
+            (face.height / 2) + 20       // Ligeiramente maior para garantir captura
         );
         
-        // Recorta a imagem em tons de cinza apenas para essa região
         let face_roi = Mat::roi(&gray, eye_region)?;
 
-        // 3. Procura os olhos APENAS dentro dessa pequena região cortada
-        let mut eyes = Vector::<Rect>::new();
+        // ========== OTIMIZAÇÃO 3: SPLIT L/R CONFORME SUA IDEIA ==========
+        let mid_x = eye_region.width / 2;
+
+        // Detecta OLHO ESQUERDO
+        let left_roi_rect = Rect::new(0, 0, mid_x, eye_region.height);
+        let left_roi = Mat::roi(&face_roi, left_roi_rect)?;
+        
+        let mut left_eyes = Vector::<Rect>::new();
         self.eye_cascade.detect_multi_scale(
-            &face_roi,
-            &mut eyes,
-            1.1,
-            5, // Exige mais certeza para evitar falsos olhos no rosto
+            &left_roi,
+            &mut left_eyes,
+            1.05,  // ← Escala fina para cada metade
+            10,    // ← OTIMIZAÇÃO: minNeighbors mais alto (menos falsos positivos)
             0,
-            Size::new(20, 20),
+            Size::new(15, 15),
             Size::new(0, 0),
         )?;
 
-        // Pega no máximo 2 olhos e traduz as coordenadas de volta para a tela cheia
-        for eye in eyes.iter().take(2) {
+        // Detecta OLHO DIREITO
+        let right_roi_rect = Rect::new(mid_x, 0, mid_x, eye_region.height);
+        let right_roi = Mat::roi(&face_roi, right_roi_rect)?;
+        
+        let mut right_eyes = Vector::<Rect>::new();
+        self.eye_cascade.detect_multi_scale(
+            &right_roi,
+            &mut right_eyes,
+            1.05,
+            10,
+            0,
+            Size::new(15, 15),
+            Size::new(0, 0),
+        )?;
+
+        // Coleta olho esquerdo
+        if !left_eyes.is_empty() {
+            let eye = left_eyes.get(0)?;
             let center_x = eye_region.x + eye.x + eye.width / 2;
+            let center_y = eye_region.y + eye.y + eye.height / 2;
+            eye_centers.push(Point::new(center_x, center_y));
+        }
+
+        // Coleta olho direito
+        if !right_eyes.is_empty() {
+            let eye = right_eyes.get(0)?;
+            let center_x = eye_region.x + mid_x + eye.x + eye.width / 2;
             let center_y = eye_region.y + eye.y + eye.height / 2;
             eye_centers.push(Point::new(center_x, center_y));
         }
@@ -96,21 +151,24 @@ impl VisionEngine for OpenCvTracker {
 // =====================================================================
 fn main() -> opencv::Result<()> {
     // === A MÁGICA PARA A "BATATA" ===
-    // Trava o OpenCV para usar apenas 1 ou 2 threads. 
-    // Adeus uso de CPU em 700%!
     core::set_num_threads(2)?;
 
-    println!("Iniciando Motor Visual (OpenCV Mode)...");
+    println!("Iniciando Motor Visual (OpenCV Mode - OTIMIZADO)...");
 
     let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?;
     if !videoio::VideoCapture::is_opened(&cam)? {
         panic!("Não foi possível abrir a câmera!");
     }
 
+    // ========== OTIMIZAÇÃO 4: REDIMENSIONAR FRAME ==========
+    // Detectar em resolução menor = bem mais rápido
+    // Você pode ajustar o scale_factor entre 0.5 e 1.0
+    let scale_factor = 0.7;  // Processa em 70% da resolução
+
     let mut tracker = OpenCvTracker::new("haarcascade_frontalface_default.xml", "haarcascade_eye.xml")
         .expect("Arquivos XML não encontrados na raiz!");
 
-    let window_name = "Rust Eye Tracker - Limpo";
+    let window_name = "Rust Eye Tracker - Otimizado";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
 
     let mut sys = System::new();
@@ -119,6 +177,7 @@ fn main() -> opencv::Result<()> {
     let mut frames = 0;
     let mut last_print = Instant::now();
     let mut frame = Mat::default();
+    let mut resized_frame = Mat::default();
 
     loop {
         cam.read(&mut frame)?;
@@ -126,15 +185,33 @@ fn main() -> opencv::Result<()> {
             continue;
         }
 
-        // Se quiser otimizar MAIS AINDA, você pode redimensionar o 'frame'
-        // aqui antes de passar pro tracker usando imgproc::resize.
+        // ========== OTIMIZAÇÃO 5: REDIMENSIONAR ANTES DE DETECTAR ==========
+        let new_width = (frame.size()?.width as f32 * scale_factor) as i32;
+        let new_height = (frame.size()?.height as f32 * scale_factor) as i32;
+        
+        imgproc::resize(
+            &frame,
+            &mut resized_frame,
+            Size::new(new_width, new_height),
+            0.0,
+            0.0,
+            imgproc::INTER_LINEAR,
+        )?;
 
-        let eyes = tracker.detect_eyes(&frame)?;
+        // Detecta nos frame redimensionado
+        let mut eyes = tracker.detect_eyes(&resized_frame)?;
 
-        // Desenha os pontos vermelhos
-        for eye in eyes {
-            let red = Scalar::new(0.0, 0.0, 255.0, 0.0);
-            imgproc::circle(&mut frame, eye, 6, red, -1, imgproc::LINE_8, 0)?;
+        // Escala coordenadas de volta para o frame original
+        let inv_scale = 1.0 / scale_factor;
+        for eye in &mut eyes {
+            eye.x = (eye.x as f32 * inv_scale) as i32;
+            eye.y = (eye.y as f32 * inv_scale) as i32;
+        }
+
+        // Desenha os pontos vermelhos no frame ORIGINAL para exibição
+        for eye in &eyes {
+            let red = Scalar::new(0.0, 255.0, 0.0, 0.0);
+            imgproc::circle(&mut frame, *eye, 3, red, -1, imgproc::LINE_8, 0)?;
         }
 
         highgui::imshow(window_name, &frame)?;
