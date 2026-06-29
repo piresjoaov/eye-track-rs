@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 sysinfo = "0.30"
 opencv = "0.99.0"
+enigo = "0.1"

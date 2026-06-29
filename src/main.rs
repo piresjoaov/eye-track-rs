@@ -4,6 +4,45 @@ use opencv::{
 };
 use std::time::Instant;
 use sysinfo::System;
+use enigo::{Enigo, MouseControllable};
+
+// =====================================================================
+// NOVO: CONTROLADOR DE MOUSE E SUAVIZAÇÃO (EMA)
+// =====================================================================
+pub struct MouseController {
+    enigo: Enigo,
+    smoothed_x: f32,
+    smoothed_y: f32,
+    alpha: f32,        // O fator de suavização (0.0 a 1.0). ~0.15 é um bom começo.
+    screen_w: f32,
+    screen_h: f32,
+}
+
+impl MouseController {
+    pub fn new(alpha: f32, screen_w: f32, screen_h: f32) -> Self {
+        Self {
+            enigo: Enigo::new(),
+            smoothed_x: screen_w / 2.0, // Começa no centro da tela
+            smoothed_y: screen_h / 2.0,
+            alpha,
+            screen_w,
+            screen_h,
+        }
+    }
+
+    pub fn update(&mut self, raw_x: f32, raw_y: f32) {
+        // 1. O FILTRO EMA: Mistura a nova posição com a antiga
+        self.smoothed_x = (self.alpha * raw_x) + ((1.0 - self.alpha) * self.smoothed_x);
+        self.smoothed_y = (self.alpha * raw_y) + ((1.0 - self.alpha) * self.smoothed_y);
+
+        // 2. MOVE O MOUSE (Apenas se a mudança for significativa para poupar CPU)
+        let _ = self.enigo.mouse_move_to(self.smoothed_x as i32, self.smoothed_y as i32);
+    }
+
+    pub fn get_position(&self) -> (i32, i32) {
+        (self.smoothed_x as i32, self.smoothed_y as i32)
+    }
+}
 
 // =====================================================================
 // 1. A INTERFACE LIMPA
@@ -181,7 +220,7 @@ impl VisionEngine for OpenCvTracker {
 }
 
 // =====================================================================
-// 4. O LOOP PRINCIPAL
+// 4. O LOOP PRINCIPAL COM CONTROLE DE MOUSE
 // =====================================================================
 fn main() -> opencv::Result<()> {
     // === INÍCIO DA TELEMETRIA DETALHADA ===
@@ -231,8 +270,13 @@ fn main() -> opencv::Result<()> {
         println!("[ESTIMATIVA] RAM Headless (sem HighGUI): ~{} MB", headless_mb);
     }
     
+    // ========== INICIALIZA O CONTROLADOR DE MOUSE ==========
+    // IMPORTANTE: Substitua 1920 e 1080 pela resolução real do seu monitor!
+    let mut mouse_ctrl = MouseController::new(0.15, 1920.0, 1080.0);
+    
     println!("\n===== INICIANDO LOOP =====\n");
-    println!("[INFO] Estratégia: Reutilizar ROI de face/olhos por 3-5 frames\n");
+    println!("[INFO] Estratégia: Reutilizar ROI de face/olhos por 3-5 frames");
+    println!("[INFO] MOUSE CONTROL ATIVADO - Pressione ESC para sair\n");
 
     let mut frames = 0;
     let mut last_print = Instant::now();
@@ -267,14 +311,58 @@ fn main() -> opencv::Result<()> {
             eye.y = (eye.y as f32 * inv_scale) as i32;
         }
 
-        // Desenha os pontos vermelhos no frame ORIGINAL para exibição
-        for eye in &eyes {
-            let green = Scalar::new(0.0, 255.0, 0.0, 0.0);
-            imgproc::circle(&mut frame, *eye, 3, green, -1, imgproc::LINE_8, 0)?;
+        // ========== NOVO: LÓGICA DO MOUSE ==========
+        if eyes.len() == 2 {
+            // Se achou os dois olhos, tira a média (ponto entre o nariz)
+            let gaze_x = (eyes[0].x + eyes[1].x) as f32 / 2.0;
+            let gaze_y = (eyes[0].y + eyes[1].y) as f32 / 2.0;
+
+            // --- CALIBRAÇÃO (Ajuste esses valores testando na sua webcam) ---
+            // Qual é a área (x, y) da câmera que representa as pontas da sua tela?
+            // DICA: Olhe para cada canto da tela e anote a posição do seu olho
+            let cam_min_x = 150.0; // Ponto x quando você olha pra ponta ESQUERDA da tela
+            let cam_max_x = 450.0; // Ponto x quando você olha pra ponta DIREITA
+            let cam_min_y = 100.0; // Ponto y quando olha pro TOPO
+            let cam_max_y = 300.0; // Ponto y quando olha pro CHÃO
+
+            // 1. Normaliza o valor da câmera para uma porcentagem (0.0 a 1.0)
+            let mut pct_x = (gaze_x - cam_min_x) / (cam_max_x - cam_min_x);
+            let mut pct_y = (gaze_y - cam_min_y) / (cam_max_y - cam_min_y);
+
+            // Garante que não ultrapassa os limites da tela
+            pct_x = pct_x.clamp(0.0, 1.0);
+            pct_y = pct_y.clamp(0.0, 1.0);
+
+            // 2. Mapeia a porcentagem para os pixels do monitor (ex: 1920x1080)
+            // OBS: A câmera espelha a imagem, então invertemos o eixo X (1.0 - pct_x)
+            let target_screen_x = (1.0 - pct_x) * mouse_ctrl.screen_w;
+            let target_screen_y = pct_y * mouse_ctrl.screen_h;
+
+            // 3. Suaviza e move o mouse!
+            mouse_ctrl.update(target_screen_x, target_screen_y);
         }
 
-        // ========== DEBUG: Mostra quantos olhos foram detectados ==========
-        let status_text = format!("Olhos detectados: {}", eyes.len());
+        // Desenha os pontos vermelhos no frame ORIGINAL para exibição
+        for (idx, eye) in eyes.iter().enumerate() {
+            let red = Scalar::new(0.0, 255.0, 0.0, 0.0);
+            imgproc::circle(&mut frame, *eye, 5, red, -1, imgproc::LINE_8, 0)?;
+            
+            // Desenha o índice do olho
+            imgproc::put_text(
+                &mut frame,
+                &format!("{}", idx),
+                Point::new(eye.x + 10, eye.y - 10),
+                imgproc::FONT_HERSHEY_SIMPLEX,
+                0.5,
+                red,
+                1,
+                imgproc::LINE_8,
+                false,
+            )?;
+        }
+
+        // ========== DEBUG: Mostra status e posição do mouse ==========
+        let status_text = format!("Olhos: {} | Mouse: {:?}", eyes.len(), mouse_ctrl.get_position());
         let text_color = if eyes.len() == 2 {
             Scalar::new(0.0, 255.0, 0.0, 0.0) // Verde (2 olhos)
         } else if eyes.len() == 1 {
