@@ -13,7 +13,18 @@ pub trait VisionEngine {
 }
 
 // =====================================================================
-// 2. A IMPLEMENTAÇÃO OPENCV (OTIMIZADA PARA "BATATA")
+// 2. UTILITÁRIOS DE DEBUG
+// =====================================================================
+fn print_ram(sys: &mut System, pid: sysinfo::Pid, label: &str) {
+    sys.refresh_processes();
+    if let Some(process) = sys.process(pid) {
+        let ram_mb = process.memory() / 1024 / 1024;
+        println!("[RAM] {} ............ {} MB", label, ram_mb);
+    }
+}
+
+// =====================================================================
+// 3. A IMPLEMENTAÇÃO OPENCV (OTIMIZADA PARA "BATATA")
 // =====================================================================
 pub struct OpenCvTracker {
     face_cascade: objdetect::CascadeClassifier,
@@ -42,9 +53,9 @@ impl VisionEngine for OpenCvTracker {
         let mut gray = Mat::default();
         imgproc::cvt_color(frame, &mut gray, imgproc::COLOR_BGR2GRAY, 0)?;
         
-        // Lighter histogram equalization - use a separate output to avoid borrow conflicts
-        let mut equalized = Mat::default();
-        imgproc::equalize_hist(&gray, &mut equalized)?;
+        // ========== OTIMIZAÇÃO: REMOVER EQUALIZED DESNECESSÁRIA ==========
+        // Não usava equalized_hist porque detectamos em &gray, não em &equalized
+        // Isso economiza ~0.5 a 1 MB de alocação desnecessária
 
         let mut face = None;
 
@@ -147,18 +158,28 @@ impl VisionEngine for OpenCvTracker {
 }
 
 // =====================================================================
-// 3. O LOOP PRINCIPAL
+// 4. O LOOP PRINCIPAL COM TELEMETRIA DETALHADA
 // =====================================================================
 fn main() -> opencv::Result<()> {
+    // === INÍCIO DA TELEMETRIA DETALHADA ===
+    let mut sys = System::new();
+    let pid = sysinfo::get_current_pid().expect("Falha ao capturar PID");
+    
+    println!("\n===== TELEMETRIA DE MEMÓRIA =====\n");
+    
+    print_ram(&mut sys, pid, "Inicial");
+
     // === A MÁGICA PARA A "BATATA" ===
     core::set_num_threads(2)?;
 
-    println!("Iniciando Motor Visual (OpenCV Mode - OTIMIZADO)...");
+    println!("\nIniciando Motor Visual (OpenCV Mode - OTIMIZADO)...");
 
     let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?;
     if !videoio::VideoCapture::is_opened(&cam)? {
         panic!("Não foi possível abrir a câmera!");
     }
+    
+    print_ram(&mut sys, pid, "Camera");
 
     // ========== OTIMIZAÇÃO 4: REDIMENSIONAR FRAME ==========
     // Detectar em resolução menor = bem mais rápido
@@ -167,16 +188,24 @@ fn main() -> opencv::Result<()> {
 
     let mut tracker = OpenCvTracker::new("haarcascade_frontalface_default.xml", "haarcascade_eye.xml")
         .expect("Arquivos XML não encontrados na raiz!");
+    
+    print_ram(&mut sys, pid, "Cascade");
 
     let window_name = "Rust Eye Tracker - Otimizado";
     highgui::named_window(window_name, highgui::WINDOW_AUTOSIZE)?;
-
-    let mut sys = System::new();
-    let pid = sysinfo::get_current_pid().expect("Falha ao capturar PID");
     
+    print_ram(&mut sys, pid, "Window");
+
+    // Captura primeiro frame para medir
+    let mut frame = Mat::default();
+    cam.read(&mut frame)?;
+    
+    print_ram(&mut sys, pid, "Primeiro frame");
+    
+    println!("\n===== INICIANDO LOOP =====\n");
+
     let mut frames = 0;
     let mut last_print = Instant::now();
-    let mut frame = Mat::default();
     let mut resized_frame = Mat::default();
 
     loop {
@@ -227,7 +256,7 @@ fn main() -> opencv::Result<()> {
             if let Some(process) = sys.process(pid) {
                 let ram_mb = process.memory() / 1024 / 1024;
                 let cpu_usage = process.cpu_usage();
-                println!("[Telemetria OpenCV] FPS: {} | CPU: {:.1}% | RAM: {} MB", frames, cpu_usage, ram_mb);
+                println!("[Telemetria] FPS: {} | CPU: {:.1}% | RAM: {} MB", frames, cpu_usage, ram_mb);
             }
             frames = 0;
             last_print = Instant::now();
